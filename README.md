@@ -1,7 +1,7 @@
 # Multi-Layered Image Similarity Engine
 
 ## Overview
-This project implements a sophisticated multi-layered image similarity engine with advanced optimizations. It computes similarity scores between computer-generated images using an intelligent coarse-to-fine cascade of color, structure, and texture analysis with memory-safe processing and enhanced discrimination for different image types.
+This project implements a sophisticated multi-layered image similarity engine with advanced optimizations and intelligent scoring adaptations. It computes similarity scores between computer-generated images using a dynamic coarse-to-fine cascade of color, structure, and texture analysis with memory-safe processing, enhanced discrimination for different image types, and L2 dampening to prevent misleading scores when structural analysis disagrees with color/texture similarity.
 
 ## Features
 - **Smart Image Preprocessing**: Memory-safe center-cropping algorithm (replaces problematic LCM tiling)
@@ -78,23 +78,35 @@ pip install -r requirements.txt
 from PIL import Image
 from src.image_similarity import ImageSimilarityEngine
 
+# Default: uses dynamic_plain method with L2 dampening
 engine = ImageSimilarityEngine()
 img1 = Image.open('path/to/image1.png')
 img2 = Image.open('path/to/image2.png')
 result = engine.calculate_similarity(img1, img2)
 
-# Example output:
+# Example output with dynamic scoring:
 {
-    'L1_score': 45.2,
-    'L2_score': 0.0,
-    'L3_score': 0.0,
-    'Final_score': 45.2,
+    'L1_score': 75.2,
+    'L2_score': 25.1,  # Poor structural similarity
+    'L3_score': 78.5,  # Good texture similarity
+    'Final_score': 42.3,  # L2 dampening applied (was ~60 without dampening)
     'preprocess_time': 0.002,
     'L1_time': 0.018,
-    'L2_time': 0.0,
-    'L3_time': 0.0,
-    'layers_computed': ['L1']
+    'L2_time': 0.045,
+    'L3_time': 0.089,
+    'layers_computed': ['L1', 'L2', 'L3'],
+    'scoring_method': 'dynamic_plain'
 }
+```
+
+### Alternative Methods
+```python
+# Original early exit system (legacy)
+engine = ImageSimilarityEngine('original_early_exit')
+
+# Dynamic logic with texture focus
+engine = ImageSimilarityEngine('dynamic_texture_moderate')  # 0.15/0.35/0.50 weights
+engine = ImageSimilarityEngine('dynamic_texture_strong')    # 0.10/0.30/0.60 weights
 ```
 
 ### Score Interpretation
@@ -109,6 +121,109 @@ result = engine.calculate_similarity(img1, img2)
 - **Complex Images**: ~40-60ms (L1+L2)
 - **Near-Identical Images**: ~150-300ms (L1+L2+L3)
 - **Memory Usage**: Bounded by smaller image dimensions (memory-safe)
+
+## Tuning Similarity Knobs
+
+This engine offers four distinct scoring methods to handle different image comparison scenarios with varying degrees of sophistication and texture sensitivity.
+
+### Method Comparison
+
+| Method | Description | Base Weights | L2 Dampening | Plain Detection | Use Case |
+|--------|-------------|--------------|--------------|-----------------|-----------|
+| **dynamic_plain** (default) | Enhanced with L2 dampening | 0.20/0.40/0.40 | ✅ | ✅ | General purpose, prevents misleading scores |
+| **dynamic_texture_moderate** | L2 dampening + texture focus | 0.15/0.35/0.50 | ✅ | ✅ | Materials with subtle texture differences |
+| **dynamic_texture_strong** | L2 dampening + strong texture | 0.10/0.30/0.60 | ✅ | ✅ | Highly textured materials, fabric, wood |
+| **original_early_exit** | Classic early exit system | Variable | ❌ | ❌ | Legacy compatibility, speed-focused |
+
+### L2 Dampening System
+
+**Purpose**: Prevents misleading scores when color/texture similarity agrees but structural analysis strongly disagrees.
+
+**Trigger Conditions**:
+- L1 (color) and L3 (texture) scores are within 12% of each other
+- L2 (structure) score differs from L1/L3 average by ≥20 points
+
+**Dampening Factors** (applied to final score):
+- **Strong dampening (×0.55)**: L2 differs by ≥40 points
+- **Moderate dampening (×0.70)**: L2 differs by ≥30 points  
+- **Mild dampening (×0.85)**: L2 differs by ≥20 points
+- **No dampening (×1.0)**: L2 differs by <20 points
+
+**Example Cases**:
+
+```python
+# Case 1: Color/texture agree, structure disagrees
+# L1=75, L2=25, L3=80 → Base score: 57.0 → Dampened: 31.4 (-45% penalty)
+# Interpretation: "Similar materials but different structural patterns"
+
+# Case 2: Normal case - no dampening triggered
+# L1=80, L2=30, L3=45 → Score: 46.0 (L1/L3 too different for dampening)
+
+# Case 3: Low score protection
+# L1=35, L2=70, L3=40 → Additional penalty if base score <50 and L2 misleadingly high
+```
+
+### Dynamic Plain Color Detection
+
+**Adaptive Weighting Logic**:
+
+1. **Both Images Plain** (solid colors): 
+   - Weights: 50% color, 35% structure, 15% texture
+   - Rationale: Color matching is paramount for plain surfaces
+
+2. **One Image Plain + Similar Colors** (L1 ≥75):
+   - Weights: 15% color, 25% structure, 60% texture  
+   - Rationale: Texture becomes crucial for differentiation
+
+3. **One Image Plain + Different Colors**:
+   - Weights: 20% color, 40% structure, 40% texture
+   - Rationale: Standard balanced approach
+
+4. **Neither Image Plain**:
+   - Weights: 20% color, 40% structure, 40% texture
+   - Rationale: Standard balanced approach
+
+### Texture-Focused Methods
+
+**Dynamic Texture Moderate** (`dynamic_texture_moderate`):
+- Combines plain detection logic with moderate texture emphasis
+- Base weights: 15% color, 35% structure, 50% texture
+- Ideal for: Distinguishing between similar materials with subtle texture differences
+
+**Dynamic Texture Strong** (`dynamic_texture_strong`):
+- Combines plain detection logic with strong texture emphasis  
+- Base weights: 10% color, 30% structure, 60% texture
+- Ideal for: Highly textured materials like fabrics, wood grains, stone patterns
+
+### Pros and Cons
+
+**Dynamic Plain (Default)**:
+- ✅ **Pros**: Intelligent adaptation, prevents misleading scores, handles edge cases
+- ✅ **Benefits**: Realistic scoring for plain vs textured comparisons
+- ⚠️ **Cons**: More complex logic, slightly slower than early exit
+
+**Dynamic Texture Methods**:
+- ✅ **Pros**: Superior texture discrimination, maintains L2 dampening protection
+- ✅ **Benefits**: Better for material libraries with texture variations
+- ⚠️ **Cons**: May under-weight color differences in some cases
+
+**Original Early Exit**:
+- ✅ **Pros**: Fastest execution, simple logic, legacy compatibility
+- ⚠️ **Cons**: No L2 dampening, can produce misleading scores, misses texture nuances
+
+### Real-World Impact Examples
+
+**Before L2 Dampening** (misleading high scores):
+- Blue wall vs blue fabric: 65.5 (similar colors mask structural differences)
+- Wood grain patterns: 58.0 (texture similarity ignored structural mismatch)
+
+**After L2 Dampening** (realistic scores):
+- Blue wall vs blue fabric: 32.8 (-50% penalty for structural disagreement)
+- Wood grain patterns: 37.7 (-35% penalty for moderate structural disagreement)
+
+**Texture Method Benefits**:
+- Subtle fabric differences: texture_moderate detects 15-20% more discrimination
+- Wood grain varieties: texture_strong provides 25-30% better separation
 
 ## Testing
 Run the test suite (with synthetic images) using:

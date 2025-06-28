@@ -7,8 +7,19 @@ from numpy.linalg import norm
 import time
 
 class ImageSimilarityEngine:
-    def __init__(self):
-        pass
+    def __init__(self, scoring_method='dynamic_plain'):
+        """
+        Initialize the ImageSimilarityEngine with a configurable scoring method.
+        
+        Args:
+            scoring_method (str): The scoring method to use. Options:
+                - 'dynamic_plain': Dynamic weighting with L2 dampening (default)
+                - 'original_early_exit': Uses the original early-exit system  
+                - 'dynamic_texture_moderate': Dynamic logic + moderate L3 emphasis (0.15/0.35/0.50)
+                - 'dynamic_texture_strong': Dynamic logic + strong L3 emphasis (0.10/0.30/0.60)
+        """
+        self.scoring_method = scoring_method
+        self._dynamic_plain_score = 0.0  # For dynamic_plain method
 
     def calculate_similarity(self, image1: Image.Image, image2: Image.Image) -> dict:
         # Step 1: Preprocess images to ensure same dimensions (tiling/cropping logic)
@@ -25,9 +36,19 @@ class ImageSimilarityEngine:
             "L1_time": 0.0,
             "L2_time": 0.0,
             "L3_time": 0.0,
-            "layers_computed": []
+            "layers_computed": [],
+            "scoring_method": self.scoring_method
         }
 
+        if self.scoring_method == 'original_early_exit':
+            # Use the original early-exit system for backward compatibility
+            return self._calculate_similarity_original(image1, image2, results)
+        else:
+            # For all other methods (including new 'original'), always compute all layers
+            return self._calculate_similarity_no_exit(image1, image2, results)
+
+    def _calculate_similarity_original(self, image1, image2, results):
+        """Original implementation with early exits."""
         # Layer 1: Spatially-Aware Color Filter
         start_l1 = time.perf_counter()
         l1_score = self._layer1(image1, image2)
@@ -68,6 +89,238 @@ class ImageSimilarityEngine:
         # All three layers computed - original weights: L1=20%, L2=40%, L3=40%
         results["Final_score"] = 0.2 * l1_score + 0.4 * l2_score + 0.4 * l3_score
         return results
+
+    def _calculate_similarity_no_exit(self, image1, image2, results):
+        """Calculate similarity without early exits - always compute all layers."""
+        # Layer 1: Spatially-Aware Color Filter
+        start_l1 = time.perf_counter()
+        l1_score = self._layer1(image1, image2)
+        l1_time = time.perf_counter() - start_l1
+        
+        results["L1_score"] = l1_score
+        results["L1_time"] = l1_time
+        results["layers_computed"].append("L1")
+
+        # Layer 2: Structural Similarity Filter (no early exits)
+        start_l2 = time.perf_counter()
+        l2_score = self._layer2_no_exit(image1, image2)
+        l2_time = time.perf_counter() - start_l2
+        
+        results["L2_score"] = l2_score
+        results["L2_time"] = l2_time
+        results["layers_computed"].append("L2")
+
+        # Layer 3: Fine-Grained Texture Analysis
+        start_l3 = time.perf_counter()
+        l3_score = self._layer3(image1, image2)
+        l3_time = time.perf_counter() - start_l3
+        
+        results["L3_score"] = l3_score
+        results["L3_time"] = l3_time
+        results["layers_computed"].append("L3")
+
+        # Handle dynamic scoring methods (all variants with L2 dampening)
+        if self.scoring_method in ['dynamic_plain', 'dynamic_texture_moderate', 'dynamic_texture_strong']:
+            # Check if images are plain and get dynamic weights
+            is_plain_1 = self._is_plain_image(image1)
+            is_plain_2 = self._is_plain_image(image2)
+            
+            # Get base weights depending on method
+            if self.scoring_method == 'dynamic_texture_moderate':
+                w1, w2, w3 = self._get_dynamic_texture_weights(is_plain_1, is_plain_2, l1_score, 'moderate')
+            elif self.scoring_method == 'dynamic_texture_strong':
+                w1, w2, w3 = self._get_dynamic_texture_weights(is_plain_1, is_plain_2, l1_score, 'strong')
+            else:  # dynamic_plain
+                w1, w2, w3 = self._get_dynamic_weights(is_plain_1, is_plain_2, l1_score)
+            
+            # Calculate base score with dynamic weights
+            base_score = w1 * l1_score + w2 * l2_score + w3 * l3_score
+            
+            # Check for L2 dampening case
+            needs_dampening = self._detect_l2_dampening_case(l1_score, l2_score, l3_score)
+            
+            if needs_dampening:
+                dampening_factor = self._calculate_l2_dampening_factor(l1_score, l2_score, l3_score)
+                self._dynamic_plain_score = base_score * dampening_factor
+                
+                # Ensure L2 never increases a low score
+                if base_score < 50 and l2_score > (l1_score + l3_score) / 2:
+                    # Additional penalty for high L2 when overall score is low
+                    self._dynamic_plain_score *= 0.85
+            else:
+                self._dynamic_plain_score = base_score
+        
+        # Apply the selected scoring method
+        results["Final_score"] = self._compute_final_score(l1_score, l2_score, l3_score)
+        
+        return results
+
+    def _layer2_no_exit(self, img1, img2):
+        """Layer 2 implementation without early exits - always computes both 2A and 2B.
+        
+        Note: L2 scores can be negative for very dissimilar images.
+        """
+        # Step 2A: Global pHash
+        hash1 = imagehash.phash(img1)
+        hash2 = imagehash.phash(img2)
+        global_ham = hash1 - hash2
+        # Allow negative scores for L2
+        global_sim = (1 - float(global_ham) / 64) * 100
+        
+        # Step 2B: Local pHash (3x3 grid) - always compute
+        local_hams = []
+        for i in range(3):
+            for j in range(3):
+                block1 = self._crop_grid_block(img1, 3, i, j)
+                block2 = self._crop_grid_block(img2, 3, i, j)
+                h1 = imagehash.phash(block1)
+                h2 = imagehash.phash(block2)
+                local_hams.append(h1 - h2)
+        avg_local_ham = np.mean(local_hams)
+        # Allow negative scores for L2
+        local_sim = (1 - avg_local_ham / 64) * 100
+        
+        # Always compute full L2 score
+        l2_score = 0.3 * global_sim + 0.7 * local_sim
+        return l2_score
+
+    def _is_within_percent(self, value1, value2, percent=10):
+        """Check if two values are within a certain percentage of each other."""
+        if value1 == 0 and value2 == 0:
+            return True
+        avg = (abs(value1) + abs(value2)) / 2
+        if avg == 0:
+            return True
+        diff_percent = abs(value1 - value2) / avg * 100
+        return diff_percent <= percent
+
+    def _detect_l2_dampening_case(self, l1_score, l2_score, l3_score, similarity_threshold=12, l2_diff_threshold=20):
+        """
+        Detect if L1 and L3 are similar but L2 is significantly different.
+        
+        Args:
+            l1_score, l2_score, l3_score: Layer scores
+            similarity_threshold: % threshold for L1/L3 to be considered "similar" (default 12%)
+            l2_diff_threshold: Minimum difference for L2 to be considered "significantly different"
+        
+        Returns:
+            bool: True if dampening should be applied
+        """
+        # Check if L1 and L3 are similar (within threshold)
+        l1_l3_similar = self._is_within_percent(l1_score, l3_score, similarity_threshold)
+        
+        if not l1_l3_similar:
+            return False
+        
+        # Check if L2 is significantly different from both L1 and L3
+        l1_l3_avg = (l1_score + l3_score) / 2
+        l2_diff = abs(l2_score - l1_l3_avg)
+        
+        return l2_diff >= l2_diff_threshold
+
+    def _calculate_l2_dampening_factor(self, l1_score, l2_score, l3_score):
+        """
+        Calculate dampening factor based on L2 disagreement.
+        
+        Returns:
+            float: Dampening factor (0.5 to 1.0, where lower means more dampening)
+        """
+        l1_l3_avg = (l1_score + l3_score) / 2
+        l2_diff = abs(l2_score - l1_l3_avg)
+        
+        # More difference = more dampening (reduced by 5% to be less aggressive)
+        if l2_diff >= 40:
+            return 0.55  # Strong dampening (was 0.50)
+        elif l2_diff >= 30:
+            return 0.70  # Moderate dampening (was 0.65)
+        elif l2_diff >= 20:
+            return 0.85  # Mild dampening (was 0.80)
+        else:
+            return 1.0   # No dampening
+
+    def _get_dynamic_weights(self, is_plain_1, is_plain_2, l1_score, color_similarity_threshold=75):
+        """
+        Get dynamic weights based on plain color detection.
+        
+        Args:
+            is_plain_1: Boolean - is image 1 a plain color
+            is_plain_2: Boolean - is image 2 a plain color  
+            l1_score: Float - L1 (color) similarity score
+            color_similarity_threshold: Float - threshold for considering colors "similar"
+        
+        Returns:
+            tuple: (w1, w2, w3)
+        """
+        
+        if is_plain_1 and is_plain_2:
+            # Both images are plain colors -> prioritize color matching
+            return (0.50, 0.35, 0.15)
+        
+        elif is_plain_1 or is_plain_2:
+            # One image is plain
+            if l1_score >= color_similarity_threshold:
+                # Colors are similar -> boost texture to differentiate
+                return (0.15, 0.25, 0.60)
+            else:
+                # Colors are different -> standard weighting
+                return (0.20, 0.40, 0.40)
+        
+        else:
+            # Neither image is plain -> standard weighting
+            return (0.20, 0.40, 0.40)
+
+    def _get_dynamic_texture_weights(self, is_plain_1, is_plain_2, l1_score, texture_mode, color_similarity_threshold=75):
+        """
+        Get dynamic weights based on plain color detection with texture emphasis.
+        
+        Args:
+            is_plain_1: Boolean - is image 1 a plain color
+            is_plain_2: Boolean - is image 2 a plain color  
+            l1_score: Float - L1 (color) similarity score
+            texture_mode: String - 'moderate' or 'strong' for texture emphasis level
+            color_similarity_threshold: Float - threshold for considering colors "similar"
+        
+        Returns:
+            tuple: (w1, w2, w3) with texture emphasis applied
+        """
+        
+        # Base texture weights
+        if texture_mode == 'moderate':
+            texture_weights = (0.15, 0.35, 0.50)
+        elif texture_mode == 'strong':
+            texture_weights = (0.10, 0.30, 0.60)
+        else:
+            raise ValueError(f"Unknown texture mode: {texture_mode}")
+        
+        if is_plain_1 and is_plain_2:
+            # Both images are plain colors -> prioritize color matching
+            return (0.50, 0.35, 0.15)
+        
+        elif is_plain_1 or is_plain_2:
+            # One image is plain
+            if l1_score >= color_similarity_threshold:
+                # Colors are similar -> use maximum texture weighting
+                return texture_weights
+            else:
+                # Colors are different -> use texture weights but reduce L1 penalty
+                return (texture_weights[0] + 0.05, texture_weights[1], texture_weights[2] - 0.05)
+        
+        else:
+            # Neither image is plain -> use texture weighting
+            return texture_weights
+
+    def _compute_final_score(self, l1_score, l2_score, l3_score):
+        """Compute final score using the selected scoring method."""
+        if self.scoring_method == 'original_early_exit':
+            # Original method: simple weighted average with negative L2/L3 allowed
+            return 0.2 * l1_score + 0.4 * l2_score + 0.4 * l3_score
+        elif self.scoring_method in ['dynamic_plain', 'dynamic_texture_moderate', 'dynamic_texture_strong']:
+            # Dynamic weighting with L2 dampening - handled in _calculate_similarity_no_exit
+            return self._dynamic_plain_score
+        else:
+            raise ValueError(f"Unknown scoring method: {self.scoring_method}")
+
+
 
     def _make_same_size(self, img1, img2):
         """
@@ -156,7 +409,7 @@ class ImageSimilarityEngine:
         max_color_dist = np.sqrt(3 * 255**2)
         
         # Convert to similarity percentage (more sensitive than original algorithm)
-        color_similarity = max(0, 100 * (1 - color_dist / max_color_dist))
+        color_similarity = max(0.0, float(100 * (1 - color_dist / max_color_dist)))
         
         # For plain images, apply stricter thresholds
         # Even small color differences should result in lower scores
@@ -191,7 +444,7 @@ class ImageSimilarityEngine:
         max_perceptual_dist = np.sum(255 * weights)
         
         # Convert to similarity
-        similarity = max(0, 100 * (1 - perceptual_dist / max_perceptual_dist))
+        similarity = max(0.0, float(100 * (1 - perceptual_dist / max_perceptual_dist)))
         
         return similarity
 
@@ -271,7 +524,7 @@ class ImageSimilarityEngine:
                 h2 = imagehash.phash(block2)
                 local_hams.append(h1 - h2)
         avg_local_ham = np.mean(local_hams)
-        local_sim = max(0, (1 - avg_local_ham / 64) * 100)
+        local_sim = max(0.0, float((1 - avg_local_ham / 64) * 100))
         l2_score = 0.3 * global_sim + 0.7 * local_sim
         if avg_local_ham > 5:
             return l2_score, True
@@ -288,7 +541,10 @@ class ImageSimilarityEngine:
         return Image.fromarray(block)
 
     def _layer3(self, img1, img2):
-        # LBP histogram comparison
+        """LBP histogram comparison for texture analysis.
+        
+        Note: L3 scores can be negative for very dissimilar textures.
+        """
         gray1 = img_as_ubyte(img1.convert('L'))
         gray2 = img_as_ubyte(img2.convert('L'))
         lbp1 = local_binary_pattern(gray1, P=8, R=1, method='uniform')
@@ -297,9 +553,9 @@ class ImageSimilarityEngine:
         hist1, _ = np.histogram(lbp1, bins=n_bins, range=(0, n_bins), density=True)
         hist2, _ = np.histogram(lbp2, bins=n_bins, range=(0, n_bins), density=True)
         chi2 = 0.5 * np.sum((hist1 - hist2) ** 2 / (hist1 + hist2 + 1e-8))
+        # Allow negative scores for L3 - remove clamping to 0
         sim_value = 100 * (1 - chi2)
-        sim = sim_value if sim_value > 0 else 0.0
-        return sim
+        return sim_value
 
     def get_processed_images(self, image1: Image.Image, image2: Image.Image):
         """
